@@ -36,13 +36,18 @@ class MongodbMetrics < Sensu::Plugin::Metric::CLI::Graphite
 
   option :filter_exclude,
          :description => "Regular expression for excluding metrics",
-         :long => "--filter-exclude EXCLUDEREGEX",
+         :long => "--filter_exclude EXCLUDEREGEX",
          :default => ''
 
   option :filter_include,
          :description => "Regular expression for including metrics",
-         :long => "--filter-include INCLUDEREGEX",
+         :long => "--filter_include INCLUDEREGEX",
          :default => ''
+
+  option :filter_order,
+         :description => "Dictate the order in which the filter/list are applied, --filter_order 'filter_include,list_include,filter_exclude,list_exclude'",
+         :long => "--filter_order FILTERORDER",
+         :default => 'filter_include,list_include,filter_exclude,list_exclude'
 
   option :help,
          :long => "--help",
@@ -95,19 +100,65 @@ class MongodbMetrics < Sensu::Plugin::Metric::CLI::Graphite
     Mongo::Client.new([ "#{host}:#{port.to_s}" ])
   end
 
+  def list_include
+    if @includelist.count > 0
+      @result.delete_if{ |k,| ! @includelist.include? k }
+    end
+    @result
+  end
+
+  def filter_include
+    if @includeregex.count > 0
+      spare = []
+      @includeregex.each do |m|
+        @result.each do |k,|
+          spare << k if k.match(m.gsub("\\\\"){"\\"})
+        end
+      end
+      @result.delete_if{|k,| ! spare.include? k }
+    end
+    @result
+  end
+
+  def filter_exclude
+    if @excluderegex.count > 0
+      eject = []
+      @excluderegex.each do |m|
+        @result.each do |k,|
+          eject << k if k.match(m.gsub("\\\\"){"\\"})
+        end
+      end
+      @result.delete_if{|k,| eject.include? k }
+    end
+    @result
+  end
+
+  def list_exclude
+    if @excludelist.count > 0
+      @result.delete_if{ |k,| @excludelist.include? k }
+    end
+    @result
+  end
+
+
   def run
+    if config[:filter_order].split(',').count != 4
+      critical "The --filter_order must include all available filters/lists"
+    end
+
+
     if config[:help]
       puts "Collect metrics from MongoDB server status. Use include and exclude list/regex to limit the metrics returned"
       puts "You can use both lists and filters to restrict the metrics to collect"
-      warning "The processing order is: list_include filter_include filter_exclude list_exclude"
+      warning "The processing order defaults to: list_include filter_include filter_exclude list_exclude -- but it can be managed using --filter_order"
     else
       remove = %(localTime host version process extra_info.note repl.setName repl.secondary repl.hosts repl.arbiters repl.primary repl.me mem.bits repl.ismaster)
       prefix = config[:prefix]
 
-      excluderegex = config[:filter_exclude].split(',')
-      includeregex = config[:filter_include].split(',')
-      excludelist = config[:list_exclude].split(',')
-      includelist = config[:list_include].split(',')
+      @excluderegex = config[:filter_exclude].split(',')
+      @includeregex = config[:filter_include].split(',')
+      @excludelist = config[:list_exclude].split(',')
+      @includelist = config[:list_include].split(',')
 
       client = mongoconnect(config[:host],config[:port])
 
@@ -116,7 +167,7 @@ class MongodbMetrics < Sensu::Plugin::Metric::CLI::Graphite
       # Get the real timestamp from within serverStatus # if nil it will use default g.time_now
       timestamp = status['localTime'].to_i rescue nil
 
-      result = hash_to_dot_notation(status)
+      @result = hash_to_dot_notation(status)
 
       # Set replicaset name and short hostname
       replicaset = status['repl']['setName'] rescue 'standalone'
@@ -130,38 +181,18 @@ class MongodbMetrics < Sensu::Plugin::Metric::CLI::Graphite
       end
 
       # Exclude some values by default
-      result.delete_if{|k,| remove.include? k }
+      @result.delete_if{|k,| remove.include? k }
 
       # Apply filters in order
-      if includelist.count > 0
-        result.delete_if{ |k,| ! includelist.include? k }
-      end
-
-      if includeregex.count > 0
-        spare = []
-        includeregex.each do |m|
-          result.each do |k,|
-            spare << k if k.match(m.gsub("\\\\"){"\\"})
-          end
+      config[:filter_order].split(',').each do |m|
+        if ! self.respond_to? m 
+          warning "'#{m}' is not a valid filter name, please verify the arguments passed to the '--filter_order' option"
+        else
+          self.public_send(m) 
         end
-        result.delete_if{|k,| ! spare.include? k }
       end
 
-      if excluderegex.count > 0
-        eject = []
-        excluderegex.each do |m|
-          result.each do |k,|
-            eject << k if k.match(m.gsub("\\\\"){"\\"})
-          end
-        end
-        result.delete_if{|k,| eject.include? k }
-      end
-
-      if excludelist.count > 0
-        result.delete_if{ |k,| excludelist.include? k }
-      end
-
-      result.each { |k, v|
+      @result.each { |k, v|
 
         # Transform Time and True/False to integers
         v = v.to_i if v.is_a?(Time)
